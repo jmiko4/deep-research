@@ -1,4 +1,7 @@
-import FirecrawlApp, { SearchResponse } from '@mendable/firecrawl-js';
+import { 
+  GoogleSearchService, 
+  SearchResponse
+} from './google-search-service';
 import { generateObject } from 'ai';
 import { compact } from 'lodash-es';
 import pLimit from 'p-limit';
@@ -34,12 +37,9 @@ type ResearchResult = {
 // increase this if you have higher API rate limits
 const ConcurrencyLimit = 2;
 
-// Initialize Firecrawl with optional API key and optional base url
+// Initialize the search service
+const searchService = new GoogleSearchService();
 
-const firecrawl = new FirecrawlApp({
-  apiKey: process.env.FIRECRAWL_KEY ?? '',
-  apiUrl: process.env.FIRECRAWL_BASE_URL,
-});
 
 // take en user query, return a list of SERP queries
 async function generateSerpQueries({
@@ -97,35 +97,96 @@ async function processSerpResult({
   numLearnings?: number;
   numFollowUpQuestions?: number;
 }) {
-  const contents = compact(result.data.map(item => item.markdown)).map(
-    content => trimPrompt(content, 25_000),
+  const contents = compact(
+    result.data.flatMap(item => {
+      const content = item.markdown || item.snippet;
+      if (!content) return null;
+      return chunkContent(trimPrompt(content, 25_000));
+    })
   );
+
   log(`Ran ${query}, found ${contents.length} contents`);
 
-  const res = await generateObject({
-    model: o3MiniModel,
-    abortSignal: AbortSignal.timeout(60_000),
-    system: systemPrompt(),
-    prompt: `Given the following contents from a SERP search for the query <query>${query}</query>, generate a list of learnings from the contents. Return a maximum of ${numLearnings} learnings, but feel free to return less if the contents are clear. Make sure each learning is unique and not similar to each other. The learnings should be concise and to the point, as detailed and information dense as possible. Make sure to include any entities like people, places, companies, products, things, etc in the learnings, as well as any exact metrics, numbers, or dates. The learnings will be used to research the topic further.\n\n<contents>${contents
-      .map(content => `<content>\n${content}\n</content>`)
-      .join('\n')}</contents>`,
-    schema: z.object({
-      learnings: z
-        .array(z.string())
-        .describe(`List of learnings, max of ${numLearnings}`),
-      followUpQuestions: z
-        .array(z.string())
-        .describe(
-          `List of follow-up questions to research the topic further, max of ${numFollowUpQuestions}`,
-        ),
-    }),
-  });
-  log(
-    `Created ${res.object.learnings.length} learnings`,
-    res.object.learnings,
-  );
+  // If no contents were found, return empty results
+  if (contents.length === 0) {
+    return {
+      learnings: [],
+      followUpQuestions: []
+    };
+  }
 
-  return res.object;
+  // Add retry logic with exponential backoff
+  const maxRetries = 3;
+  let currentTry = 0;
+  let lastError: any;
+
+  while (currentTry < maxRetries) {
+    try {
+      const res = await generateObject({
+        model: o3MiniModel,
+        // Increase timeout for larger content
+        abortSignal: AbortSignal.timeout(120_000), // Increased to 120 seconds
+        system: systemPrompt(),
+        prompt: `Given the following contents from a search for the query <query>${query}</query>, generate a list of learnings from the contents. Return a maximum of ${numLearnings} learnings, but feel free to return less if the contents are clear. Make sure each learning is unique and not similar to each other. The learnings should be concise and to the point, as detailed and information dense as possible. Make sure to include any entities like people, places, companies, products, things, etc in the learnings, as well as any exact metrics, numbers, or dates. The learnings will be used to research the topic further.\n\n<contents>${contents
+          .map(content => `<content>\n${content}\n</content>`)
+          .join('\n')}</contents>`,
+        schema: z.object({
+          learnings: z
+            .array(z.string())
+            .describe(`List of learnings, max of ${numLearnings}`),
+          followUpQuestions: z
+            .array(z.string())
+            .describe(
+              `List of follow-up questions to research the topic further, max of ${numFollowUpQuestions}`,
+            ),
+        }),
+      });
+
+      log(
+        `Created ${res.object.learnings.length} learnings`,
+        res.object.learnings,
+      );
+
+      return res.object;
+    } catch (error) {
+      lastError = error;
+      currentTry++;
+      
+      if (currentTry < maxRetries) {
+        // Calculate exponential backoff time
+        const backoffTime = Math.min(1000 * Math.pow(2, currentTry), 10000);
+        log(`Retry ${currentTry}/${maxRetries} after ${backoffTime}ms for query: ${query}`);
+        await new Promise(resolve => setTimeout(resolve, backoffTime));
+      }
+    }
+  }
+
+  // If all retries failed, log the error and return empty results
+  console.error(`Failed after ${maxRetries} retries for query: ${query}`, lastError);
+  return {
+    learnings: [],
+    followUpQuestions: []
+  };
+}
+
+function chunkContent(content: string, maxLength: number = 15000): string[] {
+  if (content.length <= maxLength) return [content];
+  
+  const chunks: string[] = [];
+  let currentChunk = '';
+  const sentences = content.split(/(?<=[.!?])\s+/);
+
+  for (const sentence of sentences) {
+    if ((currentChunk + sentence).length > maxLength) {
+      if (currentChunk) chunks.push(currentChunk.trim());
+      currentChunk = sentence;
+    } else {
+      currentChunk += (currentChunk ? ' ' : '') + sentence;
+    }
+  }
+  
+  if (currentChunk) chunks.push(currentChunk.trim());
+  return chunks;
 }
 
 export async function writeFinalReport({
@@ -137,27 +198,38 @@ export async function writeFinalReport({
   learnings: string[];
   visitedUrls: string[];
 }) {
+  // Filter out empty learnings and deduplicate
+  const uniqueLearnings = [...new Set(learnings.filter(Boolean))];
+  
   const learningsString = trimPrompt(
-    learnings
+    uniqueLearnings
       .map(learning => `<learning>\n${learning}\n</learning>`)
       .join('\n'),
     150_000,
   );
 
-  const res = await generateObject({
-    model: o3MiniModel,
-    system: systemPrompt(),
-    prompt: `Given the following prompt from the user, write a final report on the topic using the learnings from research. Make it as as detailed as possible, aim for 3 or more pages, include ALL the learnings from research:\n\n<prompt>${prompt}</prompt>\n\nHere are all the learnings from previous research:\n\n<learnings>\n${learningsString}\n</learnings>`,
-    schema: z.object({
-      reportMarkdown: z
-        .string()
-        .describe('Final report on the topic in Markdown'),
-    }),
-  });
+  try {
+    const res = await generateObject({
+      model: o3MiniModel,
+      system: systemPrompt(),
+      prompt: `Given the following prompt from the user, write a final report on the topic using the learnings from research. Make it as detailed as possible, aim for 3 or more pages, include ALL the learnings from research:\n\n<prompt>${prompt}</prompt>\n\nHere are all the learnings from previous research:\n\n<learnings>\n${learningsString}\n</learnings>`,
+      schema: z.object({
+        reportMarkdown: z
+          .string()
+          .describe('Final report on the topic in Markdown'),
+      }),
+    });
 
-  // Append the visited URLs section to the report
-  const urlsSection = `\n\n## Sources\n\n${visitedUrls.map(url => `- ${url}`).join('\n')}`;
-  return res.object.reportMarkdown + urlsSection;
+    // Filter out duplicate URLs and invalid URLs
+    const uniqueUrls = [...new Set(visitedUrls.filter(url => url && url.startsWith('http')))];
+
+    // Append the visited URLs section to the report
+    const urlsSection = `\n\n## Sources\n\n${uniqueUrls.map(url => `- ${url}`).join('\n')}`;
+    return res.object.reportMarkdown + urlsSection;
+  } catch (error) {
+    console.error('Error generating final report:', error);
+    return `# Error Generating Report\n\nAn error occurred while generating the final report. Please try again.\n\n## Raw Learnings\n\n${uniqueLearnings.map(l => `- ${l}`).join('\n')}\n\n## Sources\n\n${visitedUrls.map(url => `- ${url}`).join('\n')}`;
+  }
 }
 
 export async function deepResearch({
@@ -206,7 +278,7 @@ export async function deepResearch({
     serpQueries.map(serpQuery =>
       limit(async () => {
         try {
-          const result = await firecrawl.search(serpQuery.query, {
+          const result = await searchService.search(serpQuery.query, {
             timeout: 15000,
             limit: 5,
             scrapeOptions: { formats: ['markdown'] },
